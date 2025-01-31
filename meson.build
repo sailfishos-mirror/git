@@ -170,7 +170,22 @@
 
 project('git', 'c',
   meson_version: '>=0.61.0',
-  version: 'v2.47.GIT',
+  # The version is only of cosmetic nature, so if we cannot find a shell yet we
+  # simply don't set up a version at all. This may be the case for example on
+  # Windows systems, where we first have to bootstrap the host environment.
+  version: find_program('sh', required: false).found() ? run_command(
+    'GIT-VERSION-GEN', meson.current_source_dir(), '--format=@GIT_VERSION@',
+    capture: true,
+    check: true,
+  ).stdout().strip() : 'unknown',
+  default_options: [
+    # Git requires C99 with GNU extensions, which of course isn't supported by
+    # MSVC. Funny enough, C99 doesn't work with MSVC either, as it has only
+    # learned to define __STDC_VERSION__ with C11 and later. We thus require
+    # GNU C99 and fall back to C11. Meson only learned to handle the fallback
+    # with version 1.3.0, so on older versions we use GNU C99 unconditionally.
+    'c_std=' + (meson.version().version_compare('>=1.3.0') ? 'gnu99,c11' : 'gnu99'),
+  ],
 )
 
 fs = import('fs')
@@ -248,7 +263,6 @@ libgit_sources = [
   'compat/nonblock.c',
   'compat/obstack.c',
   'compat/terminal.c',
-  'compat/zlib-uncompress2.c',
   'config.c',
   'connect.c',
   'connected.c',
@@ -481,6 +495,13 @@ libgit_sources = [
   'xdiff/xutils.c',
 ]
 
+libgit_sources += custom_target(
+  input: 'command-list.txt',
+  output: 'command-list.h',
+  command: [shell, meson.current_source_dir() + '/generate-cmdlist.sh', meson.current_source_dir(), '@OUTPUT@'],
+  env: script_environment,
+)
+
 builtin_sources = [
   'builtin/add.c',
   'builtin/am.c',
@@ -608,14 +629,7 @@ builtin_sources = [
   'builtin/write-tree.c',
 ]
 
-libgit_sources += custom_target(
-  input: 'command-list.txt',
-  output: 'command-list.h',
-  command: [shell, meson.current_source_dir() + '/generate-cmdlist.sh', meson.current_source_dir(), '@OUTPUT@'],
-  env: script_environment,
-)
-
-libgit_sources += custom_target(
+builtin_sources += custom_target(
   output: 'config-list.h',
   command: [
     shell,
@@ -626,8 +640,8 @@ libgit_sources += custom_target(
   env: script_environment,
 )
 
-libgit_sources += custom_target(
-  input: 'Documentation/githooks.txt',
+builtin_sources += custom_target(
+  input: 'Documentation/githooks.adoc',
   output: 'hook-list.h',
   command: [
     shell,
@@ -651,9 +665,15 @@ build_options_config.set('GIT_TEST_CMP_USE_COPIED_CONTEXT', '')
 build_options_config.set('GIT_TEST_INDEX_VERSION', '')
 build_options_config.set('GIT_TEST_OPTS', '')
 build_options_config.set('GIT_TEST_PERL_FATAL_WARNINGS', '')
-build_options_config.set('GIT_TEST_UTF8_LOCALE', '')
+build_options_config.set_quoted('GIT_TEST_UTF8_LOCALE', get_option('test_utf8_locale'))
 build_options_config.set_quoted('LOCALEDIR', fs.as_posix(get_option('prefix') / get_option('localedir')))
 build_options_config.set('GITWEBDIR', fs.as_posix(get_option('prefix') / get_option('datadir') / 'gitweb'))
+
+if get_option('breaking_changes')
+  build_options_config.set('WITH_BREAKING_CHANGES', 'YesPlease')
+else
+  build_options_config.set('WITH_BREAKING_CHANGES', '')
+endif
 
 if get_option('sane_tool_path') != ''
   build_options_config.set_quoted('BROKEN_PATH_FIX', 's|^\# @BROKEN_PATH_FIX@$|git_broken_path_fix "' + get_option('sane_tool_path') + '"|')
@@ -778,11 +798,23 @@ else
   build_options_config.set('NO_PERL_CPAN_FALLBACKS', '')
 endif
 
-zlib = dependency('zlib', default_options: ['default_library=static', 'tests=disabled'])
-if zlib.version().version_compare('<1.2.0')
-  libgit_c_args += '-DNO_DEFLATE_BOUND'
+zlib_backend = get_option('zlib_backend')
+if zlib_backend in ['auto', 'zlib-ng']
+  zlib_ng = dependency('zlib-ng', required: zlib_backend == 'zlib-ng')
+  if zlib_ng.found()
+    zlib_backend = 'zlib-ng'
+    libgit_c_args += '-DHAVE_ZLIB_NG'
+    libgit_dependencies += zlib_ng
+  endif
 endif
-libgit_dependencies += zlib
+if zlib_backend in ['auto', 'zlib']
+  zlib = dependency('zlib', default_options: ['default_library=static', 'tests=disabled'])
+  if zlib.version().version_compare('<1.2.0')
+    libgit_c_args += '-DNO_DEFLATE_BOUND'
+  endif
+  zlib_backend = 'zlib'
+  libgit_dependencies += zlib
+endif
 
 threads = dependency('threads', required: false)
 if threads.found()
@@ -1325,6 +1357,7 @@ if not meson.is_cross_build() and fs.exists('/dev/tty')
   libgit_c_args += '-DHAVE_DEV_TTY'
 endif
 
+csprng_backend = get_option('csprng_backend')
 https_backend = get_option('https_backend')
 sha1_backend = get_option('sha1_backend')
 sha1_unsafe_backend = get_option('sha1_unsafe_backend')
@@ -1336,7 +1369,7 @@ if https_backend == 'auto' and security_framework.found()
   https_backend = 'CommonCrypto'
 endif
 
-openssl_required = 'openssl' in [https_backend, sha1_backend, sha1_unsafe_backend, sha256_backend]
+openssl_required = 'openssl' in [csprng_backend, https_backend, sha1_backend, sha1_unsafe_backend, sha256_backend]
 openssl = dependency('openssl', required: openssl_required, default_options: ['default_library=static'])
 if https_backend == 'auto' and openssl.found()
   https_backend = 'openssl'
@@ -1421,18 +1454,30 @@ else
   error('Unhandled SHA256 backend ' + sha256_backend)
 endif
 
-if compiler.has_header_symbol('stdlib.h', 'arc4random_buf')
+# Backends are ordered to reflect our preference for more secure and faster
+# ones over the ones that are less so.
+if csprng_backend in ['auto', 'arc4random'] and compiler.has_header_symbol('stdlib.h', 'arc4random_buf', required: csprng_backend == 'arc4random')
   libgit_c_args += '-DHAVE_ARC4RANDOM'
-elif compiler.has_header_symbol('bsd/stdlib.h', 'arc4random_buf')
+  csprng_backend = 'arc4random'
+elif csprng_backend in ['auto', 'arc4random_bsd'] and compiler.has_header_symbol('bsd/stdlib.h', 'arc4random_buf', required: csprng_backend == 'arc4random_bsd')
   libgit_c_args += '-DHAVE_ARC4RANDOM_BSD'
-elif compiler.has_function('getrandom', prefix: '#include <sys/random.h>')
+  csprng_backend = 'arc4random_bsd'
+elif csprng_backend in ['auto', 'getrandom'] and compiler.has_header_symbol('sys/random.h', 'getrandom', required: csprng_backend == 'getrandom')
   libgit_c_args += '-DHAVE_GETRANDOM'
-elif compiler.has_function('getentropy', prefix: '#include <unistd.h>')
+  csprng_backend = 'getrandom'
+elif csprng_backend in ['auto', 'getentropy'] and compiler.has_header_symbol('unistd.h', 'getentropy', required: csprng_backend == 'getentropy')
   libgit_c_args += '-DHAVE_GETENTROPY'
-elif compiler.has_function('RtlGenRandom', prefix: '#include <windows.h>\n#include <ntsecapi.h>')
+  csprng_backend = 'getentropy'
+elif csprng_backend in ['auto', 'rtlgenrandom'] and compiler.has_header_symbol('ntsecapi.h', 'RtlGenRandom', prefix: '#include <windows.h>', required: csprng_backend == 'rtlgenrandom')
   libgit_c_args += '-DHAVE_RTLGENRANDOM'
-elif openssl.found()
+  csprng_backend = 'rtlgenrandom'
+elif csprng_backend in ['auto', 'openssl'] and openssl.found()
   libgit_c_args += '-DHAVE_OPENSSL_CSPRNG'
+  csprng_backend = 'openssl'
+elif csprng_backend in ['auto', 'urandom']
+  csprng_backend = 'urandom'
+else
+  error('Unsupported CSPRNG backend: ' + csprng_backend)
 endif
 
 if get_option('runtime_prefix')
@@ -1900,6 +1945,10 @@ if get_option('tests')
   subdir('t')
 endif
 
+if get_option('fuzzers')
+  subdir('oss-fuzz')
+endif
+
 subdir('bin-wrappers')
 if get_option('docs') != []
   subdir('Documentation')
@@ -1935,6 +1984,27 @@ configure_file(
   configuration: build_options_config,
 )
 
+# Development environments can be used via `meson devenv -C <builddir>`. This
+# allows you to execute test scripts directly with the built Git version and
+# puts the built version of Git in your PATH.
+devenv = environment()
+devenv.set('GIT_BUILD_DIR', meson.current_build_dir())
+devenv.prepend('PATH', meson.current_build_dir() / 'bin-wrappers')
+meson.add_devenv(devenv)
+
+# Generate the 'version' file in the distribution tarball. This is used via
+# `meson dist -C <builddir>` to populate the source archive with the Git
+# version that the archive is being generated from.
+meson.add_dist_script(
+  shell,
+  '-c',
+  '"$1" "$2" "$3" --format="@GIT_VERSION@" "$MESON_DIST_ROOT/version"',
+  'GIT-VERSION-GEN',
+  shell,
+  meson.current_source_dir() / 'GIT-VERSION-GEN',
+  meson.current_source_dir(),
+)
+
 summary({
   'curl': curl.found(),
   'expat': expat.found(),
@@ -1948,8 +2018,10 @@ summary({
 }, section: 'Auto-detected features')
 
 summary({
+  'csprng': csprng_backend,
   'https': https_backend,
   'sha1': sha1_backend,
   'sha1_unsafe': sha1_unsafe_backend,
   'sha256': sha256_backend,
+  'zlib': zlib_backend,
 }, section: 'Backends')
