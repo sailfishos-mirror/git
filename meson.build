@@ -260,6 +260,8 @@ libgit_sources = [
   'commit-graph.c',
   'commit-reach.c',
   'commit.c',
+  'common-exit.c',
+  'common-init.c',
   'compat/nonblock.c',
   'compat/obstack.c',
   'compat/terminal.c',
@@ -297,6 +299,7 @@ libgit_sources = [
   'ewah/ewah_rlw.c',
   'exec-cmd.c',
   'fetch-negotiator.c',
+  'fetch-object-info.c',
   'fetch-pack.c',
   'fmt-merge-msg.c',
   'fsck.c',
@@ -508,6 +511,7 @@ builtin_sources = [
   'builtin/annotate.c',
   'builtin/apply.c',
   'builtin/archive.c',
+  'builtin/backfill.c',
   'builtin/bisect.c',
   'builtin/blame.c',
   'builtin/branch.c',
@@ -1087,7 +1091,6 @@ if host_machine.system() == 'cygwin'
   ]
 elif host_machine.system() == 'windows'
   libgit_sources += [
-    'compat/mingw.c',
     'compat/winansi.c',
     'compat/win32/flush.c',
     'compat/win32/path-utils.c',
@@ -1114,6 +1117,9 @@ elif host_machine.system() == 'windows'
   libgit_include_directories += 'compat/win32'
   if compiler.get_id() == 'msvc'
     libgit_include_directories += 'compat/vcbuild/include'
+    libgit_sources += 'compat/msvc/compat-util.c'
+  else
+    libgit_sources += 'compat/mingw/compat-util.c'
   endif
 endif
 
@@ -1190,7 +1196,7 @@ else
     error('Native regex support requested but not found')
 endif
 
-# setitimer and friends are provided by compat/mingw.c.
+# setitimer and friends are provided by compat/mingw/compat-util.c.
 if host_machine.system() != 'windows'
   if not compiler.compiles('''
     #include <sys/time.h>
@@ -1270,7 +1276,7 @@ if not compiler.has_function('qsort')
 endif
 libgit_sources += 'compat/qsort_s.c'
 
-# unsetenv is provided by compat/mingw.c.
+# unsetenv is provided by compat/mingw/compat-util.c.
 if host_machine.system() != 'windows' and not compiler.has_function('unsetenv')
   libgit_c_args += '-DNO_UNSETENV'
   libgit_sources += 'compat/unsetenv.c'
