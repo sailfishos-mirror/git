@@ -64,6 +64,7 @@ void init_add_i_state(struct add_i_state *s, struct repository *r,
 	s->r = r;
 	s->context = -1;
 	s->interhunkcontext = -1;
+	s->auto_advance = 1;
 
 	s->use_color_interactive = check_color_config(r, "color.interactive");
 
@@ -124,6 +125,8 @@ void init_add_i_state(struct add_i_state *s, struct repository *r,
 			die(_("%s cannot be negative"), "--inter-hunk-context");
 		s->interhunkcontext = add_p_opt->interhunkcontext;
 	}
+	if (!add_p_opt->auto_advance)
+		s->auto_advance = 0;
 }
 
 void clear_add_i_state(struct add_i_state *s)
@@ -1017,6 +1020,7 @@ static int run_patch(struct add_i_state *s, const struct pathspec *ps,
 		struct add_p_opt add_p_opt = {
 			.context = s->context,
 			.interhunkcontext = s->interhunkcontext,
+			.auto_advance = s->auto_advance
 		};
 		struct strvec args = STRVEC_INIT;
 		struct pathspec ps_selected = { 0 };
