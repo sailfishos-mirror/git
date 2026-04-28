@@ -18,6 +18,9 @@
 #include "commit-graph.h"
 #include "wildmatch.h"
 #include "mem-pool.h"
+#include "pretty.h"
+#include "revision.h"
+#include "notes.h"
 
 /*
  * One day.  See the 'name a rev shortly after epoch' test in t6120 when
@@ -272,14 +275,26 @@ struct name_ref_data {
 	struct string_list exclude_filters;
 };
 
+struct pretty_format {
+	struct pretty_print_context ctx;
+	struct userformat_want want;
+};
+
 enum command_type {
 	NAME_REV = 1,
+	FORMAT_REV = 2,
+};
+
+enum stdin_mode {
+    TEXT = 1,
+    REVS = 2,
 };
 
 struct command {
 	enum command_type type;
 	union {
 		int name_only;
+		struct pretty_format *pretty_format;
 	} u;
 };
 
@@ -288,6 +303,13 @@ static void init_name_rev_command(struct command *cmd,
 {
 	cmd->type = NAME_REV;
 	cmd->u.name_only = name_only;
+}
+
+static void init_format_rev_command(struct command *cmd,
+				    struct pretty_format *pretty_format)
+{
+	cmd->type = FORMAT_REV;
+	cmd->u.pretty_format = pretty_format;
 }
 
 static struct tip_table {
@@ -495,6 +517,27 @@ static const char *get_rev_name(const struct object *o, struct strbuf *buf)
 	}
 }
 
+static const char *get_format_rev(const struct commit *c,
+				  struct pretty_format *format_ctx,
+				  struct strbuf *buf)
+{
+	strbuf_reset(buf);
+
+	if (format_ctx->want.notes) {
+		struct strbuf notebuf = STRBUF_INIT;
+
+		format_display_notes(&c->object.oid, &notebuf,
+				     get_log_output_encoding(),
+				     format_ctx->ctx.fmt == CMIT_FMT_USERFORMAT);
+		format_ctx->ctx.notes_message = strbuf_detach(&notebuf, NULL);
+	}
+
+	pretty_print_commit(&format_ctx->ctx, c, buf);
+	FREE_AND_NULL(format_ctx->ctx.notes_message);
+
+	return buf->buf;
+}
+
 static void show_name(const struct object *obj,
 		      const char *caller_name,
 		      int always, int allow_undefined, int name_only)
@@ -564,6 +607,19 @@ static void name_rev_line(char *p, struct command *cmd)
 					printf("%.*s%s", p_len - hexsz, p_start, name);
 				else
 					printf("%.*s (%s)", p_len, p_start, name);
+				break;
+			case FORMAT_REV:
+				if (!oid_ret)
+					o = parse_object(the_repository, &oid);
+				if (o && o->type == OBJ_COMMIT)
+					name = get_format_rev((const struct commit *)o,
+							      cmd->u.pretty_format,
+							      &buf);
+				*(p + 1) = c;
+				if (name)
+					printf("%.*s%s", p_len - hexsz, p_start, name);
+				else
+					printf("%.*s", p_len, p_start);
 				break;
 			default:
 				BUG("uncovered case: %d", cmd->type);
@@ -716,5 +772,135 @@ int cmd_name_rev(int argc,
 	string_list_clear(&data.exclude_filters, 0);
 	mem_pool_discard(&string_pool, 0);
 	object_array_clear(&revs);
+	return 0;
+}
+
+static enum stdin_mode parse_stdin_mode(const char *stdin_mode)
+{
+	if (!strcmp(stdin_mode, "text"))
+		return TEXT;
+	else if (!strcmp(stdin_mode, "revs") ||
+		 !strcmp(stdin_mode, "rev"))
+		return REVS;
+	else
+		die(_("'%s' needs to be either text, revs, or rev"),
+		    "--stdin-mode");
+}
+
+static char const *const format_rev_usage[] = {
+	N_("(EXPERIMENTAL!) git format-rev --stdin-mode=<mode> --format=<pretty> [--notes=<ref>]"),
+	NULL
+};
+
+int cmd_format_rev(int argc,
+		   const char **argv,
+		   const char *prefix,
+		   struct repository *repo UNUSED)
+{
+	const char *format = NULL;
+	enum stdin_mode stdin_mode;
+	const char *stdin_mode_arg = NULL;
+	struct display_notes_opt format_notes_opt;
+	struct rev_info format_rev = REV_INFO_INIT;
+	struct pretty_format format_pp = { 0 };
+	struct string_list notes = STRING_LIST_INIT_NODUP;
+	struct strbuf scratch_buf = STRBUF_INIT;
+	struct command cmd;
+	struct option opts[] = {
+		OPT_STRING(0, "format", &format, N_("format"),
+			   N_("pretty format to use")),
+		OPT_STRING(0, "stdin-mode", &stdin_mode_arg, N_("stdin-mode"),
+			   N_("how revs are processed")),
+		OPT_STRING_LIST(0, "notes", &notes, N_("notes"),
+				N_("display notes for pretty format")),
+		OPT_END(),
+	};
+
+	argc = parse_options(argc, argv, prefix, opts, format_rev_usage, 0);
+
+	if (argc > 0) {
+		error(_("too many arguments"));
+		usage_with_options(format_rev_usage, opts);
+	}
+
+	if (!format)
+		die(_("'%s' is required"), "--format");
+	if (!stdin_mode_arg)
+		die(_("'%s' is required"), "--stdin-mode");
+
+	init_display_notes(&format_notes_opt);
+	stdin_mode = parse_stdin_mode(stdin_mode_arg);
+
+	get_commit_format(format, &format_rev);
+	format_pp.ctx.rev = &format_rev;
+	format_pp.ctx.fmt = format_rev.commit_format;
+	format_pp.ctx.abbrev = format_rev.abbrev;
+	format_pp.ctx.date_mode_explicit = format_rev.date_mode_explicit;
+	format_pp.ctx.date_mode = format_rev.date_mode;
+	format_pp.ctx.color = GIT_COLOR_AUTO;
+
+	userformat_find_requirements(format,
+				     &format_pp.want);
+	if (format_pp.want.notes) {
+		int ignore_show_notes = 0;
+		struct string_list_item *n;
+
+		for_each_string_list_item(n, &notes)
+			enable_ref_display_notes(&format_notes_opt,
+						 &ignore_show_notes,
+						 n->string);
+		load_display_notes(&format_notes_opt);
+	}
+
+	init_format_rev_command(&cmd, &format_pp);
+
+	switch (stdin_mode) {
+	case TEXT:
+		while (strbuf_getline(&scratch_buf, stdin) != EOF) {
+			strbuf_addch(&scratch_buf, '\n');
+			name_rev_line(scratch_buf.buf, &cmd);
+		}
+		break;
+	case REVS:
+		while (strbuf_getline(&scratch_buf, stdin) != EOF) {
+			struct object_id oid;
+			struct object *object;
+			struct object *peeled;
+			struct commit *commit;
+
+			if (repo_get_oid(the_repository, scratch_buf.buf, &oid)) {
+				fprintf(stderr, "Could not get sha1 for %s. Skipping.\n",
+					scratch_buf.buf);
+				continue;
+			}
+
+			object = parse_object(the_repository, &oid);
+			if (!object) {
+				fprintf(stderr, "Could not get object for %s. Skipping.\n",
+					scratch_buf.buf);
+				continue;
+			}
+
+			peeled = deref_tag(the_repository, object, scratch_buf.buf, 0);
+			if (peeled && peeled->type == OBJ_COMMIT)
+				commit = (struct commit *)peeled;
+			if (!commit) {
+				fprintf(stderr, "Could not get commit for %s. Skipping.\n",
+					*argv);
+				continue;
+			}
+
+			get_format_rev(commit, &format_pp, &scratch_buf);
+			printf("%s\n", scratch_buf.buf);
+			strbuf_release(&scratch_buf);
+		}
+		break;
+	default:
+		BUG("uncovered case: %d", stdin_mode);
+	}
+
+	strbuf_release(&scratch_buf);
+	string_list_clear(&notes, 0);
+	release_display_notes(&format_notes_opt);
 	return 0;
 }
