@@ -866,7 +866,6 @@ int cmd_format_rev(int argc,
 			struct object_id oid;
 			struct object *object;
 			struct object *peeled;
-			struct commit *commit;
 
 			if (repo_get_oid(the_repository, scratch_buf.buf, &oid)) {
 				fprintf(stderr, "Could not get sha1 for %s. Skipping.\n",
@@ -882,15 +881,15 @@ int cmd_format_rev(int argc,
 			}
 
 			peeled = deref_tag(the_repository, object, scratch_buf.buf, 0);
-			if (peeled && peeled->type == OBJ_COMMIT)
-				commit = (struct commit *)peeled;
-			if (!commit) {
-				fprintf(stderr, "Could not get commit for %s. Skipping.\n",
+			if (!peeled || peeled->type != OBJ_COMMIT) {
+				fprintf(stderr,
+					"Could not get commit for %s. Skipping.\n",
 					*argv);
 				continue;
 			}
 
-			get_format_rev(commit, &format_pp, &scratch_buf);
+			get_format_rev((struct commit *)peeled,
+				       &format_pp, &scratch_buf);
 			printf("%s\n", scratch_buf.buf);
 			strbuf_release(&scratch_buf);
 		}
